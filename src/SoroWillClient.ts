@@ -4831,6 +4831,46 @@ export class SoroWillClient {
     return this.rpcPool.withFailover((server) => server.prepareTransaction(transaction));
   }
 
+  /**
+   * Simulate a contract invocation without signing or submitting it (#797).
+   *
+   * Builds the invocation transaction, runs a Soroban simulation and returns a
+   * preview of the outcome. Nothing is committed to the ledger and no wallet
+   * signature is requested. On failure the raw simulation error is exposed as
+   * the typed `simulationError` property (never in `message`).
+   */
+  async simulateInvocation(
+    method: string,
+    args: Record<string, unknown> = {},
+    options?: { sourcePublicKey?: string },
+  ): Promise<SimulationPreview> {
+    const transaction = await this.buildInvocationTransaction(
+      method,
+      args,
+      options?.sourcePublicKey,
+    );
+    const response = await this.rpcPool.withFailover((server) =>
+      server.simulateTransaction(transaction),
+    );
+
+    const success = rpc.Api.isSimulationSuccess(response);
+    const rawError = success ? undefined : rpc.Api.isSimulationError(response) ? response.error : undefined;
+    const minResourceFee = success ? response.minResourceFee : undefined;
+    const transactionData = success ? response.transactionData : undefined;
+    const result = success ? response.result : undefined;
+
+    return {
+      success,
+      method,
+      minResourceFee,
+      fee: minResourceFee !== undefined ? String(BigInt(BASE_FEE) + BigInt(minResourceFee)) : undefined,
+      returnValue: result?.retval,
+      transactionData,
+      simulationError: rawError,
+      error: rawError,
+    };
+  }
+
   private async getWalletPublicKey(): Promise<string> {
     const publicKey = await this.wallet.getPublicKey();
     if (!StrKey.isValidEd25519PublicKey(publicKey)) {
