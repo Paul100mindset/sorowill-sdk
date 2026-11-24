@@ -333,6 +333,13 @@ export interface CreateWillParams {
   readonly gracePeriodDays: number;
   /** 0 to 3 guardian addresses that may jointly force an early release. */
   readonly guardians: readonly string[];
+  /**
+   * Optional caller-supplied metadata attached to the created will (#799).
+   * Stored client-side and retrievable via
+   * {@link SoroWillClient.getWillMetadata}. Must be JSON-serializable and
+   * within {@link MAX_METADATA_BYTES} when serialized.
+   */
+  readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
 /** Parameters for {@link SoroWillClient.updateBeneficiaries}. */
@@ -513,6 +520,13 @@ export interface RequestOptions {
    * @default false
    */
   skipCache?: boolean;
+  /**
+   * Optional caller-supplied metadata attached to the submitted transaction
+   * (#799). Must be JSON-serializable and within
+   * {@link MAX_METADATA_BYTES} when serialized. Retrieve it later with
+   * {@link SoroWillClient.getTransactionMetadata}.
+   */
+  metadata?: Readonly<Record<string, unknown>>;
 }
 
 /**

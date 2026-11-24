@@ -270,6 +270,44 @@ export function validateMemo(memo: string): void {
   }
 }
 
+/** Maximum serialized size in bytes of caller-supplied transaction metadata (#799). */
+export const MAX_METADATA_BYTES = 4096;
+
+/**
+ * Validates caller-supplied transaction metadata (#799): it must be a plain
+ * object whose JSON serialization fits within {@link MAX_METADATA_BYTES}.
+ *
+ * @param metadata - The metadata object to validate.
+ * @returns A deep copy of the metadata, safe to store without aliasing the caller's object.
+ * @throws {TypeError} when the value is not a plain object.
+ * @throws {RangeError} when the value is not JSON-serializable or too large.
+ */
+export function validateMetadata(
+  metadata: unknown,
+): Readonly<Record<string, unknown>> {
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+    throw new TypeError('Invalid metadata: expected a plain object');
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(metadata);
+  } catch (error) {
+    throw new RangeError(
+      `Invalid metadata: value is not JSON-serializable (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  if (serialized === undefined) {
+    throw new RangeError('Invalid metadata: value is not JSON-serializable');
+  }
+  const byteLength = new TextEncoder().encode(serialized).length;
+  if (byteLength > MAX_METADATA_BYTES) {
+    throw new RangeError(
+      `Metadata is too large: ${byteLength} bytes (JSON), maximum is ${MAX_METADATA_BYTES} bytes`,
+    );
+  }
+  return JSON.parse(serialized) as Record<string, unknown>;
+}
+
 /**
  * Validates a beneficiary count against the contract maximum (#736).
  *
