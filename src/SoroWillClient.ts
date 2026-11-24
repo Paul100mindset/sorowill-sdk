@@ -719,6 +719,85 @@ function cloneWill(will: Will): Will {
   };
 }
 
+/** Default lifetime of a guardian vote before it expires, in milliseconds (24h). */
+export const DEFAULT_GUARDIAN_VOTE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Per-guardian vote state returned by {@link SoroWillClient.getGuardianVotingStatus}. */
+export interface GuardianVoteStatus {
+  /** The guardian address. */
+  readonly guardian: string;
+  /** Whether this guardian has cast a vote in the current release cycle. */
+  readonly hasVoted: boolean;
+  /** When the guardian voted, or `null` if they have not voted. */
+  readonly votedAt: Date | null;
+  /** When the vote expires, or `null` if the guardian has not voted. */
+  readonly expiresAt: Date | null;
+  /** `true` when the guardian voted but the vote has since expired. */
+  readonly expired: boolean;
+}
+
+/** Aggregate guardian voting status for a will. */
+export interface GuardianVotingStatus {
+  /** The will ID these votes belong to. */
+  readonly willId: string;
+  /** Number of distinct guardians who have voted in the current cycle. */
+  readonly votesCast: number;
+  /** Number of guardians required to release the will (2 of N). */
+  readonly votesRequired: number;
+  /** `true` when enough unexpired votes exist to release the will. */
+  readonly thresholdReached: boolean;
+  /** Per-guardian vote details, in the will's guardian order. */
+  readonly guardians: readonly GuardianVoteStatus[];
+}
+
+/**
+ * Builds the per-guardian voting status for a will from its guardian list,
+ * vote count and the timestamps of the votes cast (#800).
+ *
+ * The contract only exposes the aggregate `guardian_votes` count, so vote
+ * timestamps are attributed in guardian order: the first `votesCast` guardians
+ * are treated as the voters. A vote is expired when `now - votedAt` exceeds
+ * `ttlMs`; expired votes no longer count toward the release threshold.
+ */
+export function buildGuardianVotingStatus(
+  will: Pick<Will, 'id' | 'guardians' | 'guardianVotes'>,
+  voteTimestamps: readonly (Date | number | null | undefined)[] = [],
+  options: { now?: number; ttlMs?: number } = {},
+): GuardianVotingStatus {
+  const now = options.now ?? Date.now();
+  const ttlMs = options.ttlMs ?? DEFAULT_GUARDIAN_VOTE_TTL_MS;
+  const votesRequired = 2;
+  const votesCast = Math.max(0, Math.min(will.guardianVotes, will.guardians.length));
+
+  const guardians: GuardianVoteStatus[] = will.guardians.map((guardian, index) => {
+    const rawTimestamp = voteTimestamps[index];
+    const votedAt =
+      index < votesCast && rawTimestamp !== null && rawTimestamp !== undefined
+        ? rawTimestamp instanceof Date
+          ? new Date(rawTimestamp.getTime())
+          : new Date(rawTimestamp)
+        : null;
+    const expiresAt = votedAt === null ? null : new Date(votedAt.getTime() + ttlMs);
+    const expired = expiresAt !== null && expiresAt.getTime() <= now;
+    return {
+      guardian,
+      hasVoted: index < votesCast,
+      votedAt,
+      expiresAt,
+      expired,
+    };
+  });
+
+  const activeVotes = guardians.filter((g) => g.hasVoted && !g.expired).length;
+  return {
+    willId: will.id,
+    votesCast,
+    votesRequired,
+    thresholdReached: activeVotes >= votesRequired,
+    guardians,
+  };
+}
+
 function mapWillList(raw: unknown): Will[] {
   if (!Array.isArray(raw)) {
     throw new SoroWillError(
@@ -2689,6 +2768,33 @@ export class SoroWillClient {
     const { status } = mapWill(raw);
     this.statusCache.set(canonicalWillId, { status, expiresAt: now + WILL_STATUS_CACHE_TTL_MS });
     return status;
+  }
+
+  /**
+   * Returns the guardian voting status of `willId`, including per-guardian
+   * vote details, vote timestamps and whether each vote has expired (#800).
+   *
+   * The contract exposes only the aggregate vote count, so vote timestamps are
+   * attributed in guardian order (the first `votesCast` guardians are treated
+   * as the voters). Votes older than `voteTtlMs` (default 24h) are reported as
+   * `expired` and no longer count toward the 2-of-N release threshold.
+   *
+   * @param willId - The will to inspect.
+   * @param options - Optional request options plus `voteTtlMs` / `now` overrides.
+   * @returns The aggregate and per-guardian voting status.
+   * @throws {SoroWillInvalidIdError} If `willId` is not a valid numeric ID.
+   * @throws {WillNotFoundError} If the will does not exist on-chain.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   */
+  async getGuardianVotingStatus(
+    willId: string,
+    options?: RequestOptions & { voteTtlMs?: number; now?: number },
+  ): Promise<GuardianVotingStatus> {
+    const will = await this.getWill(willId, options);
+    return buildGuardianVotingStatus(will, [], {
+      now: options?.now,
+      ttlMs: options?.voteTtlMs,
+    });
   }
 
   /**
