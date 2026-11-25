@@ -5,6 +5,7 @@ import {
   Contract,
   FeeBumpTransaction,
   Networks,
+  hash as stellarHash,
   StrKey,
   Transaction,
   TransactionBuilder,
@@ -92,6 +93,7 @@ import {
   WalletNetworkMismatchError,
   WillContractError,
   WebSocketNotConfiguredError,
+  SseNotConfiguredError,
   GracePeriodActiveError,
 } from './errors';
 import { assertValidBeneficiaryAddresses, assertValidStellarAddress, deepFreezeObject, hasDuplicateBeneficiaries, MAX_BENEFICIARIES, MAX_GUARDIANS, PERCENTAGE_SUM_EPSILON, validateBeneficiaries, validateGuardianSignature } from './utils';
@@ -211,6 +213,28 @@ export const NETWORK_CONFIG: Record<SoroWillNetwork, NetworkConfig> = {
     networkPassphrase: Networks.PUBLIC,
   },
 };
+
+/**
+ * Result of a sign-only operation: a signed, prepared transaction envelope
+ * that has **not** been submitted to the network.
+ *
+ * Use {@link SoroWillClient.submitSignedTransaction} to submit it later, or
+ * hand the XDR to an offline/air-gapped signer or relayer.
+ */
+export interface SignedTransactionResult {
+  /** Signed transaction envelope XDR (base64), ready for submission. */
+  signedTxXdr: string;
+  /** Network passphrase the envelope was signed for. */
+  networkPassphrase: string;
+  /** Transaction hash of the signed envelope (hex). */
+  txHash: string;
+  /** Source account public key of the signed transaction. */
+  sourcePublicKey: string;
+  /** Sequence number of the signed transaction (base-10 string). */
+  sequence: string;
+  /** Total fee of the signed transaction in stroops (base-10 string). */
+  fee: string;
+}
 
 export interface RpcRetryOptions {
   maxAttempts: number;
@@ -430,10 +454,12 @@ export interface SoroWillClientOptions {
    */
   eventStreamUrl?: string;
   /**
-   * Default polling interval for event subscriptions, in milliseconds. Must be
-   * a finite number greater than zero; otherwise {@link SoroWillConfigError} is
-   * thrown at construction.
+   * Optional Server-Sent Events (SSE) endpoint used for real-time event
+   * delivery when `subscribeToEvents` is called with `transport: 'sse'` (or
+   * `'auto'`, which prefers SSE over WebSocket and polling).
    */
+  eventSseUrl?: string;
+  /** Default polling interval for event subscriptions. */
   defaultPollIntervalMs?: number;
   /**
    * Optional override for the `fetch` implementation used by event-polling
@@ -637,6 +663,66 @@ const DEFAULT_POLL_ATTEMPTS = 30;
  */
 const EXCLUSIVE_INVOKE_METHODS: ReadonlySet<string> = new Set(['check_in']);
 
+/** How a {@link SoroWillClient.batchCheckIn} run treats individual failures. */
+export type BatchCheckInMode = 'best-effort' | 'atomic';
+
+/** Per-will outcome of a {@link SoroWillClient.batchCheckIn} run. */
+export interface BatchCheckInResult {
+  /** The will id that was checked in. */
+  willId: string;
+  /** `true` when the check-in succeeded (or was skipped in atomic mode). */
+  success: boolean;
+  /** Number of attempts made for this will (0 when skipped). */
+  attempts: number;
+  /** Transaction hash of the successful check-in, when available. */
+  txHash?: string;
+  /** The error that caused the final failure, when `success` is `false`. */
+  error?: unknown;
+  /** `true` when the will was not attempted because an earlier will failed in atomic mode. */
+  skipped?: boolean;
+}
+
+/** Options for {@link SoroWillClient.batchCheckIn}. */
+export interface BatchCheckInOptions {
+  /**
+   * `'best-effort'` (default) attempts every will and reports each outcome.
+   * `'atomic'` stops at the first failure and marks the remaining wills as skipped.
+   */
+  mode?: BatchCheckInMode;
+  /** Maximum attempts per will, including the first. Defaults to `3`. */
+  maxAttempts?: number;
+  /** Base delay in milliseconds for exponential backoff between retries. Defaults to `250`. */
+  retryBaseDelayMs?: number;
+  /** Maximum delay in milliseconds between retries. Defaults to `5_000`. */
+  retryMaxDelayMs?: number;
+  /** Called after each will settles, in input order. */
+  onResult?: (result: BatchCheckInResult) => void;
+}
+
+/** Aggregate outcome of a {@link SoroWillClient.batchCheckIn} run. */
+export interface BatchCheckInSummary {
+  /** The mode the run used. */
+  mode: BatchCheckInMode;
+  /** Per-will results, in input order. */
+  results: BatchCheckInResult[];
+  /** Will ids that were checked in successfully. */
+  succeeded: string[];
+  /** Will ids that failed after all retries. */
+  failed: string[];
+  /** Will ids not attempted because of an earlier failure in atomic mode. */
+  skipped: string[];
+  /** `true` when every will succeeded. */
+  allSucceeded: boolean;
+}
+
+const DEFAULT_BATCH_CHECKIN_MAX_ATTEMPTS = 3;
+const DEFAULT_BATCH_CHECKIN_RETRY_BASE_DELAY_MS = 250;
+const DEFAULT_BATCH_CHECKIN_RETRY_MAX_DELAY_MS = 5_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * How long `subscribeToEvents` waits for a WebSocket to fire `onopen` before
  * giving up and falling back to HTTP polling. Guards against a server that
@@ -645,6 +731,9 @@ const EXCLUSIVE_INVOKE_METHODS: ReadonlySet<string> = new Set(['check_in']);
  * leave the returned promise pending forever.
  */
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_SSE_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_SSE_RECONNECT_DELAY_MS = 1_000;
+const DEFAULT_SSE_MAX_RECONNECT_DELAY_MS = 30_000;
 
 const DEFAULT_RETRY_OPTIONS: RpcRetryOptions = {
   maxAttempts: 1,
@@ -1458,6 +1547,7 @@ export class SoroWillClient {
   private readonly eventSource?: WillEventSource | undefined;
   private readonly eventRpcUrl: string;
   private readonly eventStreamUrl: string | undefined;
+  private readonly eventSseUrl: string | undefined;
   private readonly defaultPollIntervalMs: number;
   private readonly webSocketFactory: ((url: string) => WebSocketLike) | undefined;
   private readonly fetchImpl: FetchImplementation;
@@ -1569,6 +1659,7 @@ export class SoroWillClient {
     this.specJsonOverride = options.specJson;
     this.eventRpcUrl = options.eventRpcUrl ?? rpcUrl;
     this.eventStreamUrl = options.eventStreamUrl;
+    this.eventSseUrl = options.eventSseUrl;
     if (this.eventStreamUrl !== undefined) {
       if (!this.eventStreamUrl.startsWith('wss://')) {
         throw new InvalidWebSocketUrlError(this.eventStreamUrl);
@@ -3590,11 +3681,13 @@ export class SoroWillClient {
 
   /**
    * Subscribes to SoroWill contract events, delivering each decoded event to
-   * `listener` as it arrives. Prefers a WebSocket stream (via
+   * `listener` as it arrives. Prefers a Server-Sent Events stream (via
+   * `eventSseUrl`) when configured, then a WebSocket stream (via
    * `webSocketFactory` and `eventStreamUrl`) when both are configured,
    * automatically falling back to HTTP polling (via `fetch` and
-   * `eventRpcUrl`) if the WebSocket connection fails to open. Pass
-   * `{ transport: 'polling' }` to skip WebSocket entirely, or
+   * `eventRpcUrl`) if the stream connection fails to open. Pass
+   * `{ transport: 'sse' }` to require SSE (throws
+   * {@link SseNotConfiguredError} when `eventSseUrl` is not configured), or
    * `{ transport: 'websocket' }` to require it — this throws
    * {@link WebSocketNotConfiguredError} instead of silently falling back to
    * polling if `webSocketFactory`/`eventStreamUrl` aren't configured.
@@ -3602,7 +3695,7 @@ export class SoroWillClient {
    * **Operation Type:** Read-only (Subscription)
    *
    * @readonly
-   * @remarks Read-only subscription operation. Subscribes to contract events via WebSocket or polling without submitting transactions or modifying ledger state.
+   * @remarks Read-only subscription operation. Subscribes to contract events via SSE, WebSocket or polling without submitting transactions or modifying ledger state.
    *
    * @param listener - Callback receiving each incoming {@link SoroWillEvent}.
    * @param options - Subscription options (transport, cursor, intervals, etc.).
@@ -3643,6 +3736,14 @@ export class SoroWillClient {
           userListener(event);
         }
       };
+    }
+
+    const wantsSse = options.transport === 'sse' || options.transport === undefined;
+    if (wantsSse && this.eventSseUrl) {
+      return this.startSseSubscription(listener, options);
+    }
+    if (options.transport === 'sse') {
+      throw new SseNotConfiguredError();
     }
 
     const wantsWebSocket = options.transport !== 'polling';
@@ -3776,6 +3877,176 @@ export class SoroWillClient {
         clearConnectTimer();
         resolve(this.startPollingSubscription(listener, options));
       };
+    });
+  }
+
+  /**
+   * Subscribes to contract events over Server-Sent Events (SSE), decoding each
+   * `data:` frame as an event record and delivering it to `listener`.
+   *
+   * The connection auto-reconnects with exponential backoff when the stream
+   * drops, resuming from the last seen cursor. Connection failures are
+   * reported through `options.onError`; if the initial connection cannot be
+   * established the subscription falls back to polling (unless
+   * `transport: 'sse'` was requested explicitly, in which case the error is
+   * surfaced and the subscription is closed).
+   */
+  private async startSseSubscription(
+    listener: (event: SoroWillEvent) => void,
+    options: EventSubscriptionOptions,
+  ): Promise<EventSubscription> {
+    const baseUrl = this.eventSseUrl!;
+    const connectTimeoutMs = options.sseConnectTimeoutMs ?? DEFAULT_SSE_CONNECT_TIMEOUT_MS;
+    const baseReconnectDelayMs = options.sseReconnectDelayMs ?? DEFAULT_SSE_RECONNECT_DELAY_MS;
+    const maxReconnectDelayMs = options.sseMaxReconnectDelayMs ?? DEFAULT_SSE_MAX_RECONNECT_DELAY_MS;
+    const maxReconnectAttempts = options.sseMaxReconnectAttempts ?? Infinity;
+
+    let closed = false;
+    let settled = false;
+    let cursor = options.cursor;
+    let reconnectAttempts = 0;
+    let controller: AbortController | undefined;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const buildUrl = (): string => {
+      const url = new URL(baseUrl);
+      url.searchParams.set('contractId', this.getContractId());
+      if (cursor !== undefined) url.searchParams.set('cursor', cursor);
+      for (const type of options.eventTypes ?? []) url.searchParams.append('eventType', type);
+      return url.toString();
+    };
+
+    const deliver = (data: string): void => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data);
+      } catch (err) {
+        options.onError?.(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      const records = Array.isArray(parsed)
+        ? (parsed as RawEventRecord[])
+        : ((parsed as { events?: RawEventRecord[] }).events ?? [parsed as RawEventRecord]);
+      for (const raw of records) {
+        if (closed) return;
+        if (raw?.pagingToken ?? raw?.id) cursor = raw.pagingToken ?? raw.id;
+        try {
+          listener(mapEventRecord(raw, this.getContractId()));
+        } catch (listenerError) {
+          const eventId = raw?.id ?? raw?.pagingToken ?? 'unknown';
+          options.onError?.(
+            new SoroWillError(`Event listener threw for event ${eventId}`, { cause: listenerError }),
+          );
+        }
+      }
+    };
+
+    const scheduleReconnect = (): void => {
+      if (closed) return;
+      if (reconnectAttempts >= maxReconnectAttempts) {
+        closed = true;
+        options.onError?.(new Error('SoroWill SSE stream reconnect attempts exhausted'));
+        return;
+      }
+      const delay = Math.min(baseReconnectDelayMs * 2 ** reconnectAttempts, maxReconnectDelayMs);
+      reconnectAttempts += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        void connect();
+      }, delay);
+    };
+
+    const connect = async (): Promise<void> => {
+      if (closed) return;
+      const abort = new AbortController();
+      controller = abort;
+      let connectTimer: ReturnType<typeof setTimeout> | undefined;
+      if (Number.isFinite(connectTimeoutMs) && connectTimeoutMs > 0) {
+        connectTimer = setTimeout(() => abort.abort(), connectTimeoutMs);
+      }
+      try {
+        const response = await this.fetchImpl(buildUrl(), {
+          headers: { Accept: 'text/event-stream' },
+          signal: abort.signal,
+        });
+        if (!response.ok || !response.body) {
+          throw new Error(`SoroWill SSE endpoint responded with status ${response.status}`);
+        }
+        if (connectTimer !== undefined) {
+          clearTimeout(connectTimer);
+          connectTimer = undefined;
+        }
+        reconnectAttempts = 0;
+        if (!settled) {
+          settled = true;
+          resolveSse(subscription);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done || closed) break;
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf('\n\n');
+          while (boundary !== -1) {
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const dataLines: string[] = [];
+            for (const line of frame.split('\n')) {
+              const trimmed = line.endsWith('\r') ? line.slice(0, -1) : line;
+              if (trimmed.startsWith('data:')) {
+                dataLines.push(trimmed.slice(trimmed.startsWith('data: ') ? 6 : 5));
+              }
+            }
+            if (dataLines.length > 0) deliver(dataLines.join('\n'));
+            boundary = buffer.indexOf('\n\n');
+          }
+        }
+        if (closed) return;
+        options.onError?.(new Error('SoroWill SSE stream closed'));
+        scheduleReconnect();
+      } catch (err) {
+        if (closed) return;
+        options.onError?.(err instanceof Error ? err : new Error(String(err)));
+        if (!settled) {
+          settled = true;
+          resolveSse(this.startPollingSubscription(listener, options));
+          return;
+        }
+        scheduleReconnect();
+      } finally {
+        if (connectTimer !== undefined) clearTimeout(connectTimer);
+      }
+    };
+
+    let resolveSse!: (subscription: EventSubscription) => void;
+    const subscription: EventSubscription = {
+      transport: 'sse',
+      get closed() {
+        return closed;
+      },
+      unsubscribe: () => {
+        if (closed) return;
+        closed = true;
+        if (reconnectTimer !== undefined) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = undefined;
+        }
+        try {
+          controller?.abort();
+        } catch {
+          // Best-effort abort; the stream may already be gone.
+        }
+      },
+      close() {
+        this.unsubscribe();
+      },
+    };
+
+    return new Promise<EventSubscription>((resolve) => {
+      resolveSse = resolve;
+      void connect();
     });
   }
 
@@ -4740,6 +5011,145 @@ export class SoroWillClient {
       txHash: sendResponse.hash,
       createdAt: txResponse.createdAt,
       returnValue: txResponse.returnValue,
+    };
+  }
+
+  /**
+   * Builds, simulates, and signs a contract invocation, returning the signed
+   * envelope **without submitting it** to the network.
+   *
+   * **Operation Type:** Read-only (Signing)
+   *
+   * @readonly
+   * @remarks Sign-only operation. Simulates the invocation (an RPC round trip)
+   * and asks the wallet to sign, but never calls `sendTransaction`, so ledger
+   * state is unchanged. Use this for offline, air-gapped, or relayer workflows
+   * where the signed envelope is submitted later — for example by
+   * {@link submitSignedTransaction} from another process or machine.
+   *
+   * The returned envelope is already prepared (footprint and resource fees
+   * included), so it can be submitted as-is once the network is reachable.
+   *
+   * @param method - The contract method name (e.g. `'check_in'`, `'create_will'`)
+   * @param args - Arguments to the method as a record of name-value pairs
+   * @param options - Optional per-call timeout, abort signal, and `maxFee` guard
+   * @returns The signed envelope XDR plus its hash, source, sequence, and fee
+   * @throws {ReadOnlyModeError} If the client is in read-only mode
+   * @throws {ExorbitantFeeError} If the prepared fee exceeds `options.maxFee`
+   * @throws {SoroWillError} If the wallet returns a fee-bump envelope
+   *
+   * @example
+   * ```ts
+   * const signed = await client.signTransaction('check_in', { will_id: 1n });
+   * // Later, from a machine with network access:
+   * await client.submitSignedTransaction(signed.signedTxXdr);
+   * ```
+   */
+  async signTransaction(
+    method: string,
+    args: Record<string, unknown>,
+    options?: RequestOptions,
+  ): Promise<SignedTransactionResult> {
+    // #635: Signing is a write-path operation; reject in read-only mode.
+    if (this.readOnly) {
+      throw new ReadOnlyModeError(method);
+    }
+    await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
+    options?.signal?.throwIfAborted();
+
+    const builtTx = await this.buildInvocationTransaction(method, args);
+    options?.signal?.throwIfAborted();
+    const prepared = await this.prepareInvocation(method, args, builtTx);
+    this.assertTransactionNetwork(prepared);
+
+    if (options?.maxFee !== undefined) {
+      const maxFeeBigInt = BigInt(options.maxFee);
+      if (BigInt(prepared.fee) > maxFeeBigInt) {
+        throw new ExorbitantFeeError(String(prepared.fee), maxFeeBigInt.toString());
+      }
+    }
+
+    options?.signal?.throwIfAborted();
+    const signedTxResponse = await this.signWithWallet(prepared.toXDR());
+    options?.signal?.throwIfAborted();
+    const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
+    const signedTx = TransactionBuilder.fromXDR(signedTxXdr, this.networkPassphrase);
+    if (!(signedTx instanceof Transaction)) {
+      throw new SoroWillError(
+        'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
+      );
+    }
+    assertSupportedSignatureAlgorithm(signedTx, { context: `signTransaction(${method})` });
+
+    return {
+      signedTxXdr,
+      networkPassphrase: this.networkPassphrase,
+      txHash: stellarHash(signedTx.toXDR()).toString('hex'),
+      sourcePublicKey: signedTx.source,
+      sequence: signedTx.sequence,
+      fee: signedTx.fee,
+    };
+  }
+
+  /**
+   * Signs an already-built (and ideally prepared) transaction envelope without
+   * submitting it.
+   *
+   * **Operation Type:** Read-only (Signing)
+   *
+   * @readonly
+   * @remarks Sign-only operation. Hands the envelope to the configured wallet
+   * and returns the signed XDR. No RPC submission happens, so this works for
+   * offline workflows where the envelope was prepared earlier (e.g. via
+   * {@link buildSep7SigningUri} or {@link buildTransaction} +
+   * `prepareTransaction`).
+   *
+   * @param transactionXdr - Unsigned (or partially signed) transaction envelope XDR
+   * @param options - Optional abort signal
+   * @returns The signed envelope XDR plus its hash, source, sequence, and fee
+   * @throws {ReadOnlyModeError} If the client is in read-only mode
+   * @throws {SoroWillError} If the XDR is a fee-bump envelope
+   *
+   * @example
+   * ```ts
+   * const signed = await client.signTransactionXdr(preparedXdr);
+   * console.log(signed.signedTxXdr);
+   * ```
+   */
+  async signTransactionXdr(
+    transactionXdr: string,
+    options?: RequestOptions,
+  ): Promise<SignedTransactionResult> {
+    if (this.readOnly) {
+      throw new ReadOnlyModeError('signTransactionXdr');
+    }
+    options?.signal?.throwIfAborted();
+    const envelope = TransactionBuilder.fromXDR(transactionXdr, this.networkPassphrase);
+    this.assertTransactionNetwork(envelope);
+    if (!(envelope instanceof Transaction)) {
+      throw new SoroWillError(
+        'Expected a plain Transaction envelope to sign, but received FeeBumpTransaction',
+      );
+    }
+
+    const signedTxResponse = await this.signWithWallet(transactionXdr);
+    options?.signal?.throwIfAborted();
+    const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
+    const signedTx = TransactionBuilder.fromXDR(signedTxXdr, this.networkPassphrase);
+    if (!(signedTx instanceof Transaction)) {
+      throw new SoroWillError(
+        'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
+      );
+    }
+    assertSupportedSignatureAlgorithm(signedTx, { context: 'signTransactionXdr' });
+
+    return {
+      signedTxXdr,
+      networkPassphrase: this.networkPassphrase,
+      txHash: stellarHash(signedTx.toXDR()).toString('hex'),
+      sourcePublicKey: signedTx.source,
+      sequence: signedTx.sequence,
+      fee: signedTx.fee,
     };
   }
 

@@ -270,42 +270,66 @@ export function validateMemo(memo: string): void {
   }
 }
 
-/** Maximum serialized size in bytes of caller-supplied transaction metadata (#799). */
-export const MAX_METADATA_BYTES = 4096;
+/** Maximum check-in period horizon accepted by the contract, in years (#757). */
+export const MAX_CHECKIN_PERIOD_YEARS = 10;
+
+/** Milliseconds in one day, used for date-horizon validation (#757). */
+const MS_PER_DAY = 86_400_000;
 
 /**
- * Validates caller-supplied transaction metadata (#799): it must be a plain
- * object whose JSON serialization fits within {@link MAX_METADATA_BYTES}.
+ * Computes the latest check-in period date the contract accepts: 10 years from
+ * `now` (#757).
  *
- * @param metadata - The metadata object to validate.
- * @returns A deep copy of the metadata, safe to store without aliasing the caller's object.
- * @throws {TypeError} when the value is not a plain object.
- * @throws {RangeError} when the value is not JSON-serializable or too large.
+ * @param now - Reference time; defaults to the current time.
+ * @returns The maximum allowed date.
  */
-export function validateMetadata(
-  metadata: unknown,
-): Readonly<Record<string, unknown>> {
-  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
-    throw new TypeError('Invalid metadata: expected a plain object');
+export function getMaxCheckinPeriodDate(now: Date = new Date()): Date {
+  const max = new Date(now.getTime());
+  max.setUTCFullYear(max.getUTCFullYear() + MAX_CHECKIN_PERIOD_YEARS);
+  return max;
+}
+
+/**
+ * Validates that a check-in period date does not exceed the contract maximum
+ * of 10 years in the future (#757).
+ *
+ * @param date - The check-in period date to validate.
+ * @param now - Reference time; defaults to the current time.
+ * @throws {RangeError} when the date is invalid or beyond the maximum allowed date.
+ */
+export function validateCheckinPeriodDate(date: unknown, now: Date = new Date()): asserts date is Date {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    throw new RangeError('Invalid check-in period date: expected a valid Date');
   }
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(metadata);
-  } catch (error) {
+  const maxDate = getMaxCheckinPeriodDate(now);
+  if (date.getTime() > maxDate.getTime()) {
     throw new RangeError(
-      `Invalid metadata: value is not JSON-serializable (${error instanceof Error ? error.message : String(error)})`,
+      `Invalid check-in period date: ${date.toISOString()} exceeds the maximum allowed date of ` +
+        `${maxDate.toISOString()} (${MAX_CHECKIN_PERIOD_YEARS} years from now)`,
     );
   }
-  if (serialized === undefined) {
-    throw new RangeError('Invalid metadata: value is not JSON-serializable');
+}
+
+/**
+ * Validates a check-in period expressed in days against the contract maximum
+ * horizon of 10 years (#757).
+ *
+ * @param days - Number of days from `now` for the check-in period.
+ * @param now - Reference time; defaults to the current time.
+ * @throws {RangeError} when the period is not a positive integer or exceeds the maximum.
+ */
+export function validateCheckinPeriodDaysHorizon(days: unknown, now: Date = new Date()): asserts days is number {
+  if (!Number.isInteger(days) || (days as number) < 1) {
+    throw new RangeError(`Invalid check-in period: expected a positive integer number of days, got ${String(days)}`);
   }
-  const byteLength = new TextEncoder().encode(serialized).length;
-  if (byteLength > MAX_METADATA_BYTES) {
+  const maxDate = getMaxCheckinPeriodDate(now);
+  const maxDays = Math.floor((maxDate.getTime() - now.getTime()) / MS_PER_DAY);
+  if ((days as number) > maxDays) {
     throw new RangeError(
-      `Metadata is too large: ${byteLength} bytes (JSON), maximum is ${MAX_METADATA_BYTES} bytes`,
+      `Invalid check-in period: ${days} days exceeds the maximum allowed date of ` +
+        `${maxDate.toISOString()} (${MAX_CHECKIN_PERIOD_YEARS} years from now)`,
     );
   }
-  return JSON.parse(serialized) as Record<string, unknown>;
 }
 
 /**
